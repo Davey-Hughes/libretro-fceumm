@@ -3256,6 +3256,14 @@ static void raster_frame_begin(void)
 
    if (!raster_poll_cb)
       return;
+   /* Drawn over or composed after the last line */
+   if (     GameInfo->type == GIT_NSF
+         || (show_crosshair && FCEU_InputDrawsFrame()))
+      return;
+#ifdef HAVE_HDPACK
+   if (hdnes_active)
+      return;
+#endif
 #ifdef HAVE_NTSC_FILTER
    if (use_ntsc)
       return;

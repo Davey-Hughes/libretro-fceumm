@@ -126,6 +126,12 @@ void FCEU_DrawInput(uint8_t *buf)
          FCExp->Draw(buf, JPAttribFC);
 }
 
+/* Whether FCEU_DrawInput may draw into the frame */
+int FCEU_InputDrawsFrame(void)
+{
+   return JPorts[0]->Draw || JPorts[1]->Draw || (FCExp && FCExp->Draw);
+}
+
 /**********************************************************************/
 /* This function is a quick hack to get the NSF player to use emulated gamepad
    input.

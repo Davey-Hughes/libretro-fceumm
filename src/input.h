@@ -20,6 +20,7 @@ typedef struct {
 } INPUTCFC;
 
 void FCEU_DrawInput(uint8_t *buf);
+int FCEU_InputDrawsFrame(void);
 void FCEU_UpdateInput(void);
 void InitializeInput(void);
 extern void (*PStrobe[2])(void);
