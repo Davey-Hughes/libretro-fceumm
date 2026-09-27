@@ -150,11 +150,20 @@ RETRO_HW_RENDER_INTEFACE_GSKIT_PS2 *ps2 = NULL;
 
 extern void FCEU_ZapperSetTolerance(int t);
 
+/* Builds that convert frames in software report their rows as they
+ * are finished */
+#if !defined(PSP) && !defined(RENDER_GSKIT_PS2)
+#define HAVE_RASTER_POLL
+#endif
+
 static retro_video_refresh_t video_cb = NULL;
 static retro_input_poll_t poll_cb = NULL;
 static retro_input_state_t input_cb = NULL;
 static retro_audio_sample_batch_t audio_batch_cb = NULL;
 retro_environment_t environ_cb = NULL;
+#ifdef HAVE_RASTER_POLL
+static retro_raster_poll_t raster_poll_cb = NULL;
+#endif
 #ifdef PSP
 static bool crop_overscan;
 #endif
@@ -2034,6 +2043,10 @@ void retro_deinit (void)
 #if defined(RENDER_GSKIT_PS2)
    ps2 = NULL;
 #endif
+#ifdef HAVE_RASTER_POLL
+   raster_poll_cb = NULL;
+   PPU_LineHook   = NULL;
+#endif
    libretro_supports_bitmasks = false;
    libretro_msg_interface_version = 0;
    DPSW_Cleanup();
@@ -3166,9 +3179,99 @@ static void FCEUD_Update(uint8_t *XBuf, int32_t *Buffer, int Count)
 {
 }
 
-static void retro_run_blit(uint8_t *gfx)
+#ifdef HAVE_RASTER_POLL
+/* The frame being built, when its rows are reported as they finish */
+static struct
+{
+   bool     active;
+   unsigned next_line; /* first NES line not yet converted */
+   bpp_t   *buf;       /* the frame as video_cb will get it */
+   unsigned width;
+   unsigned height;
+   size_t   pitch;
+} raster_frame;
+
+/* Converts NES lines [from, to) of gfx into target, whose row 0 is NES
+ * line crop_overscan_v_top; lines outside the crop are skipped. */
+static void blit_sd_lines(const uint8_t *gfx, unsigned from, unsigned to,
+      bpp_t *target, size_t target_stride, unsigned width)
 {
    unsigned x, y;
+   const unsigned top       = crop_overscan_v_top;
+   const unsigned bottom    = NES_HEIGHT - crop_overscan_v_bottom;
+   /* Hoist loop-invariant decisions out of the hot per-pixel
+    * loop. The PPU writes a uniform colour_emphasis byte to
+    * every entry of XDBuf for a given scanline (ppu.c:683-685),
+    * so emphasis is constant per row - branch once per row, not
+    * per pixel. NSF and use_raw_palette flags don't change mid-
+    * frame either. */
+   const bool is_nsf        = (GameInfo->type == GIT_NSF);
+   const uint8_t pixel_mask = use_raw_palette ? 0x3F : 0xFF;
+
+   if (from < top)
+      from = top;
+   if (to > bottom)
+      to = bottom;
+
+   for (y = from; y < to; y++)
+   {
+      const uint8_t *in = gfx + y * NES_WIDTH + crop_overscan_h_left;
+      bpp_t *out_row    = target + (size_t)(y - top) * target_stride;
+      uint8_t deemp     = is_nsf ? 0 : XDBuf[in - XBuf];
+
+      if (deemp != 0)
+      {
+         unsigned base = 256u + ((unsigned)(deemp & 0x07) << 6);
+         for (x = 0; x < width; x++)
+            out_row[x] = retro_palette[base + (in[x] & 0x3F)];
+      }
+      else
+      {
+         for (x = 0; x < width; x++)
+            out_row[x] = retro_palette[in[x] & pixel_mask];
+      }
+   }
+}
+
+static void raster_line_done(int line)
+{
+   unsigned next = (unsigned)line + 1;
+
+   blit_sd_lines(XBuf, raster_frame.next_line, next,
+         raster_frame.buf, raster_frame.width, raster_frame.width);
+   raster_frame.next_line = next;
+
+   if (     (unsigned)line >= (unsigned)crop_overscan_v_top
+         && next <= NES_HEIGHT - (unsigned)crop_overscan_v_bottom)
+      raster_poll_cb(raster_frame.buf, raster_frame.width,
+            raster_frame.height, raster_frame.pitch,
+            (unsigned)line - crop_overscan_v_top);
+}
+
+static void raster_frame_begin(void)
+{
+   raster_frame.active    = false;
+   raster_frame.next_line = 0;
+   PPU_LineHook           = NULL;
+
+   if (!raster_poll_cb)
+      return;
+#ifdef HAVE_NTSC_FILTER
+   if (use_ntsc)
+      return;
+#endif
+
+   raster_frame.width  = NES_WIDTH  - crop_overscan_h_left - crop_overscan_h_right;
+   raster_frame.height = NES_HEIGHT - crop_overscan_v_top  - crop_overscan_v_bottom;
+   raster_frame.pitch  = raster_frame.width * sizeof(bpp_t);
+   raster_frame.buf    = fceu_video_out;
+   raster_frame.active = true;
+   PPU_LineHook        = raster_line_done;
+}
+#endif
+
+static void retro_run_blit(uint8_t *gfx)
+{
 #ifdef PSP
    static unsigned int __attribute__((aligned(16))) d_list[32];
    void* texture_vram_p = NULL;
@@ -3296,7 +3399,6 @@ static void retro_run_blit(uint8_t *gfx)
       width  -= (crop_overscan_h_left + crop_overscan_h_right);
       height -= (crop_overscan_v_top + crop_overscan_v_bottom);
       pitch   = width * sizeof(bpp_t);
-      gfx    += (crop_overscan_v_top * 256) + crop_overscan_h_left;
 
       {
          /* Try GET_CURRENT_SOFTWARE_FRAMEBUFFER for zero-copy: if the
@@ -3310,7 +3412,9 @@ static void retro_run_blit(uint8_t *gfx)
          fb.width  = width;
          fb.height = height;
          fb.access_flags = RETRO_MEMORY_ACCESS_WRITE;
-         if (environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
+         /* A frame whose rows were reported is already in fceu_video_out */
+         if (     !raster_frame.active
+               && environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
                && fb.format == active_pixformat
                && fb.data
                && (fb.pitch % sizeof(bpp_t)) == 0)
@@ -3320,37 +3424,8 @@ static void retro_run_blit(uint8_t *gfx)
             pitch         = fb.pitch;
          }
 
-         /* Hoist loop-invariant decisions out of the hot per-pixel
-          * loop. The PPU writes a uniform colour_emphasis byte to
-          * every entry of XDBuf for a given scanline (ppu.c:683-685),
-          * so emphasis is constant per row - branch once per row, not
-          * per pixel. NSF and use_raw_palette flags don't change mid-
-          * frame either. */
-         {
-            const uint8_t *deemp_row = XDBuf + (gfx - XBuf);
-            const bool is_nsf        = (GameInfo->type == GIT_NSF);
-            const uint8_t pixel_mask = use_raw_palette ? 0x3F : 0xFF;
-
-            for (y = 0; y < height; y++)
-            {
-               bpp_t *out_row = target + (size_t)y * target_stride;
-               uint8_t deemp = is_nsf ? 0 : deemp_row[0];
-
-               if (deemp != 0)
-               {
-                  unsigned base = 256u + ((unsigned)(deemp & 0x07) << 6);
-                  for (x = 0; x < width; x++)
-                     out_row[x] = retro_palette[base + (gfx[x] & 0x3F)];
-               }
-               else
-               {
-                  for (x = 0; x < width; x++)
-                     out_row[x] = retro_palette[gfx[x] & pixel_mask];
-               }
-               gfx       += 256;
-               deemp_row += 256;
-            }
-         }
+         blit_sd_lines(gfx, raster_frame.next_line, NES_HEIGHT,
+               target, target_stride, width);
 
          video_cb(target, width, height, pitch);
       }
@@ -3368,6 +3443,9 @@ void retro_run(void)
       check_variables(false);
 
    FCEUD_UpdateInput();
+#ifdef HAVE_RASTER_POLL
+   raster_frame_begin();
+#endif
    FCEUI_Emulate(&gfx, &sound, &ssize, 0);
 
 #ifdef HAVE_HDPACK
@@ -4028,6 +4106,18 @@ bool retro_load_game(const struct retro_game_info *info)
 #endif
    }
 
+#ifdef HAVE_RASTER_POLL
+   {
+      struct retro_raster_poll_interface raster;
+
+      raster.interface_version = RETRO_RASTER_POLL_INTERFACE_VERSION;
+      raster.raster_poll       = NULL;
+      raster_poll_cb           = NULL;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_RASTER_POLL_INTERFACE, &raster))
+         raster_poll_cb = raster.raster_poll;
+   }
+#endif
+
    /* initialize some of the default variables */
 #ifdef GEKKO
    sndsamplerate = 32000;
@@ -4337,6 +4427,10 @@ void retro_unload_game(void)
       free(hd_patched_rom);
       hd_patched_rom = NULL;
    }
+#endif
+#ifdef HAVE_RASTER_POLL
+   raster_poll_cb = NULL;
+   PPU_LineHook   = NULL;
 #endif
    FCEUI_CloseGame();
 #if defined(_3DS)

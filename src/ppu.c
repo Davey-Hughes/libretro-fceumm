@@ -116,6 +116,7 @@ static int deempcnt[8];
 
 void (*GameHBIRQHook)(void), (*GameHBIRQHook2)(void);
 void FP_FASTAPASS(1) (*PPU_hook)(uint32_t A);
+void (*PPU_LineHook)(int line);
 
 uint8_t vtoggle = 0;
 uint8_t XOffset = 0;
@@ -752,6 +753,10 @@ static void DoLine(void)
 	colour_emphasis = ((PPU[1] >> 5) << 24) | ((PPU[1] >> 5) << 16) | ((PPU[1] >> 5) << 8) | ((PPU[1] >> 5) << 0);
 	for (x = 63; x >= 0; x--)
 		*(uint32_t*)&dtarget[x << 2] = colour_emphasis;
+
+	/* The line is final from here on */
+	if (PPU_LineHook && scanline < 240)
+		PPU_LineHook(scanline);
 
     sphitx = 0x100;
 
