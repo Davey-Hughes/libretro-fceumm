@@ -3233,12 +3233,33 @@ static void blit_sd_lines(const uint8_t *gfx, unsigned from, unsigned to,
    }
 }
 
+#ifdef HAVE_NTSC_FILTER
+/* Filters NES lines [from, to) of gfx into ntsc_video_out. A line's
+ * burst phase is the frame's plus its line number, so lines can be
+ * filtered in any grouping. */
+static void blit_ntsc_lines(const uint8_t *gfx, unsigned from, unsigned to)
+{
+   if (from >= to)
+      return;
+   nes_ntsc_blit(&nes_ntsc, (NES_NTSC_IN_T const*)(gfx + from * NES_WIDTH),
+         (NES_NTSC_IN_T *)(XDBuf + from * NES_WIDTH), NES_WIDTH,
+         (burst_phase + from) % nes_ntsc_burst_count, NES_WIDTH, to - from,
+         ntsc_video_out + from * NES_NTSC_WIDTH,
+         NES_NTSC_WIDTH * sizeof(bpp_t));
+}
+#endif
+
 static void raster_line_done(int line)
 {
    unsigned next = (unsigned)line + 1;
 
-   blit_sd_lines(XBuf, raster_frame.next_line, next,
-         raster_frame.buf, raster_frame.width, raster_frame.width);
+#ifdef HAVE_NTSC_FILTER
+   if (use_ntsc)
+      blit_ntsc_lines(XBuf, raster_frame.next_line, next);
+   else
+#endif
+      blit_sd_lines(XBuf, raster_frame.next_line, next,
+            raster_frame.buf, raster_frame.width, raster_frame.width);
    raster_frame.next_line = next;
 
    if (     (unsigned)line >= (unsigned)crop_overscan_v_top
@@ -3264,15 +3285,24 @@ static void raster_frame_begin(void)
    if (hdnes_active)
       return;
 #endif
-#ifdef HAVE_NTSC_FILTER
-   if (use_ntsc)
-      return;
-#endif
 
    raster_frame.width  = NES_WIDTH  - crop_overscan_h_left - crop_overscan_h_right;
    raster_frame.height = NES_HEIGHT - crop_overscan_v_top  - crop_overscan_v_bottom;
-   raster_frame.pitch  = raster_frame.width * sizeof(bpp_t);
-   raster_frame.buf    = fceu_video_out;
+#ifdef HAVE_NTSC_FILTER
+   if (use_ntsc)
+   {
+      raster_frame.width = NES_NTSC_OUT_WIDTH(raster_frame.width);
+      raster_frame.pitch = NES_NTSC_WIDTH * sizeof(bpp_t);
+      raster_frame.buf   = ntsc_video_out
+            + (crop_overscan_h_left ? NES_NTSC_OUT_WIDTH(crop_overscan_h_left) : 0)
+            + NES_NTSC_WIDTH * crop_overscan_v_top;
+   }
+   else
+#endif
+   {
+      raster_frame.pitch = raster_frame.width * sizeof(bpp_t);
+      raster_frame.buf   = fceu_video_out;
+   }
    raster_frame.active = true;
    PPU_LineHook        = raster_line_done;
 }
@@ -3374,13 +3404,7 @@ static void retro_run_blit(uint8_t *gfx)
 #ifdef HAVE_NTSC_FILTER
    if (use_ntsc)
    {
-      burst_phase ^= 1;
-      if (ntsc_setup.merge_fields)
-         burst_phase = 0;
-
-      nes_ntsc_blit(&nes_ntsc, (NES_NTSC_IN_T const*)gfx, (NES_NTSC_IN_T *)XDBuf,
-          NES_WIDTH, burst_phase, NES_WIDTH, NES_HEIGHT,
-          ntsc_video_out, NES_NTSC_WIDTH * sizeof(bpp_t));
+      blit_ntsc_lines(gfx, raster_frame.next_line, NES_HEIGHT);
 
       width    = NES_WIDTH - crop_overscan_h_left - crop_overscan_h_right;
       width    = NES_NTSC_OUT_WIDTH(width);
@@ -3451,6 +3475,15 @@ void retro_run(void)
       check_variables(false);
 
    FCEUD_UpdateInput();
+#ifdef HAVE_NTSC_FILTER
+   /* Once a frame, before any of its lines is filtered */
+   if (use_ntsc)
+   {
+      burst_phase ^= 1;
+      if (ntsc_setup.merge_fields)
+         burst_phase = 0;
+   }
+#endif
 #ifdef HAVE_RASTER_POLL
    raster_frame_begin();
 #endif
