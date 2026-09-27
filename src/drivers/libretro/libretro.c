@@ -3262,7 +3262,7 @@ static void raster_line_done(int line)
             raster_frame.buf, raster_frame.width, raster_frame.width);
    raster_frame.next_line = next;
 
-   if (     (unsigned)line >= (unsigned)crop_overscan_v_top
+   if ((unsigned)line >= (unsigned)crop_overscan_v_top
          && next <= NES_HEIGHT - (unsigned)crop_overscan_v_bottom)
       raster_poll_cb(raster_frame.buf, raster_frame.width,
             raster_frame.height, raster_frame.pitch,
@@ -3444,8 +3444,8 @@ static void retro_run_blit(uint8_t *gfx)
          fb.width  = width;
          fb.height = height;
          fb.access_flags = RETRO_MEMORY_ACCESS_WRITE;
-         /* A frame whose rows were reported is already in fceu_video_out */
-         if (     !raster_frame.active
+         /* A polling frame is built in fceu_video_out */
+         if (!raster_frame.active
                && environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
                && fb.format == active_pixformat
                && fb.data
@@ -3488,6 +3488,9 @@ void retro_run(void)
    raster_frame_begin();
 #endif
    FCEUI_Emulate(&gfx, &sound, &ssize, 0);
+#ifdef HAVE_RASTER_POLL
+   PPU_LineHook = NULL;
+#endif
 
 #ifdef HAVE_HDPACK
    if (hdnes_active)
